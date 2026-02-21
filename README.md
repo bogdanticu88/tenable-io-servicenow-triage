@@ -1,16 +1,17 @@
 # tenable-io-servicenow-triage
 
-Triage Tenable.io vulnerabilities exported from ServiceNow into P1–P4 priorities with consistent, audit-friendly output.
+Triage Tenable.io vulnerabilities exported from ServiceNow into P1–P4 priorities with SLA tracking, age analysis, asset breakdowns, and audit-ready reports.
 
 ## Why
 
-Security teams often struggle with a high volume of vulnerabilities from Tenable.io. When this data is managed in ServiceNow, the export formats can be inconsistent and difficult to work with. This tool provides a standardized way to triage these vulnerabilities, apply consistent priority ratings, and generate clear, auditable reports.
+Security teams dealing with high-volume Tenable.io exports from ServiceNow need more than a simple priority label. This tool provides a full triage workflow: consistent priority assignment, SLA due dates, age and overdue tracking, deduplication stats, asset-level breakdowns, and clean reports in both Markdown and HTML.
 
 ## Requirements
 
 - Python 3.10+
 - pandas
 - numpy
+- jinja2
 
 ## Installation
 
@@ -21,17 +22,22 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python tenable_io_snow_triage.py <path_to_your_servicenow_export.csv>
+python tenable_io_snow_triage.py <path_to_export.csv> [options]
 ```
 
 ### Options
 
-| Flag | Description |
-|------|-------------|
-| `--asset-map <file>` | JSON file mapping asset names to priority overrides |
-| `--exceptions <file>` | JSON file listing Plugin IDs or CVEs to exclude |
-| `--output-dir <dir>` | Directory to write output files (default: current directory) |
-| `--severity-col <name>` | Override the severity column name if auto-detection fails |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--asset-map <file>` | — | JSON file mapping asset names to priority overrides |
+| `--exceptions <file>` | — | JSON file listing Plugin IDs or CVEs to exclude |
+| `--output-dir <dir>` | `.` | Directory to write output files |
+| `--severity-col <name>` | auto | Severity column name if auto-detection fails |
+| `--format <mode>` | `all` | Output format: `markdown`, `html`, or `all` |
+| `--sla-p1 <days>` | `7` | Remediation SLA in days for P1 Critical |
+| `--sla-p2 <days>` | `30` | Remediation SLA in days for P2 High |
+| `--sla-p3 <days>` | `90` | Remediation SLA in days for P3 Medium |
+| `--sla-p4 <days>` | `180` | Remediation SLA in days for P4 Low |
 
 ### Examples
 
@@ -41,13 +47,21 @@ python tenable_io_snow_triage.py <path_to_your_servicenow_export.csv>
 python tenable_io_snow_triage.py vulnerabilities.csv
 ```
 
-**Triage with asset map and exceptions, writing to a specific directory:**
+**Full triage with asset overrides, exceptions, custom SLAs, and a specific output directory:**
 
 ```bash
 python tenable_io_snow_triage.py vulnerabilities.csv \
   --asset-map assets.json \
   --exceptions exceptions.json \
-  --output-dir ./reports/2024-01-15
+  --output-dir ./reports/2024-01-15 \
+  --sla-p1 3 \
+  --format all
+```
+
+**HTML report only:**
+
+```bash
+python tenable_io_snow_triage.py vulnerabilities.csv --format html
 ```
 
 **Force a specific severity column:**
@@ -58,7 +72,7 @@ python tenable_io_snow_triage.py vulnerabilities.csv --severity-col "Risk Rating
 
 ## Severity Column Auto-Detection
 
-The script automatically detects the severity column from common export formats. You don't need to rename or reformat your CSV.
+The script detects the severity column from common export formats automatically.
 
 | Export source | Column detected |
 |---------------|----------------|
@@ -67,7 +81,7 @@ The script automatically detects the severity column from common export formats.
 | CVSS-based exports | `CVSS Risk` |
 | Custom/other | `Criticality`, `Risk Rating`, `Threat Level` |
 
-If none of these match, use `--severity-col <name>`. The script will print all available column names in the error message to help identify the right one.
+If none match, use `--severity-col <name>`. The error message prints all available column names.
 
 ## Severity Value Support
 
@@ -82,18 +96,18 @@ Values are normalized automatically regardless of format:
 
 ## Priority Mapping
 
-| Severity | Priority |
-|----------|----------|
-| Critical | P1 |
-| High | P2 |
-| Medium | P3 |
-| Low | P4 |
+| Severity | Priority | Default SLA |
+|----------|----------|-------------|
+| Critical | P1 | 7 days |
+| High | P2 | 30 days |
+| Medium | P3 | 90 days |
+| Low | P4 | 180 days |
 
-Asset map overrides are applied after the severity-based assignment. Exceptions are removed before output is written.
+Asset map overrides are applied after the severity-based assignment. Exceptions are removed before any output is written.
 
 ## Asset Map Format
 
-A JSON object mapping asset names to a priority level. Matched against any host, hostname, or asset name column in the CSV. Use this to elevate or downgrade priority for specific assets regardless of vulnerability severity.
+A JSON object mapping asset names to a priority level. Matched against any host, hostname, or asset name column in the CSV.
 
 ```json
 {
@@ -105,18 +119,52 @@ A JSON object mapping asset names to a priority level. Matched against any host,
 
 ## Exceptions Format
 
-A JSON array of identifiers to exclude from the output. Matched against all identifier columns present in the CSV (Plugin ID, CVE, Name, etc.), so a mixed list works without needing to separate by type.
+A JSON array of identifiers to exclude. Matched against all identifier columns present in the CSV (Plugin ID, CVE, Name, etc.).
 
 ```json
 ["12345", "67890", "CVE-2023-1234"]
 ```
 
-## Output
+## Age Tracking
 
-Three files are written to the output directory:
+If the CSV contains a first-seen or discovery date column (e.g. `First Seen`, `First Detected`, `Discovery Date`, `Plugin Publication Date`), the script automatically adds:
 
-| File | Description |
-|------|-------------|
-| `triaged.csv` | Original CSV with an added `Priority` column (P1–P4) |
-| `summary.md` | Markdown summary with vulnerability counts by priority |
-| `triage_run.json` | Machine-readable JSON summary for automation and integration |
+- **Age (days)** — number of days since the finding was first observed
+- **Overdue** — `True` if age exceeds the SLA for the assigned priority
+
+This requires no configuration — the column is detected automatically.
+
+## Output Files
+
+| File | Written when | Description |
+|------|-------------|-------------|
+| `triaged.csv` | Always | Original CSV with `Priority`, `Triage Reason`, `Due Date`, and (if applicable) `Age (days)`, `Overdue` columns added |
+| `summary.md` | `markdown` or `all` | Markdown report with priority breakdown, coverage stats, overdue counts, top assets, and top vulnerabilities |
+| `report.html` | `html` or `all` | Self-contained HTML report with summary cards, colour-coded sortable findings table |
+| `triage_run.json` | Always | Machine-readable JSON audit record for automation and integration |
+
+### Triage Reason column
+
+Every row in `triaged.csv` includes a `Triage Reason` column explaining the source of the priority:
+
+| Reason format | Meaning |
+|---------------|---------|
+| `severity:Critical` | Assigned from text severity label |
+| `cvss:9.8` | Assigned from numeric CVSS score |
+| `asset_override:legacy-db` | Overridden by asset map |
+
+### triage_run.json structure
+
+```json
+{
+  "run_time": "2024-01-15 14:32:01",
+  "source": "vulnerabilities.csv",
+  "severity_column": "Severity",
+  "slas": {"P1": 7, "P2": 30, "P3": 90, "P4": 180},
+  "total_vulnerabilities": 142,
+  "unique_vulnerabilities": 38,
+  "affected_assets": 12,
+  "priority_counts": {"P1": 5, "P2": 22, "P3": 89, "P4": 26},
+  "overdue": {"P1": 3, "P2": 1, "P3": 0, "P4": 0}
+}
+```
