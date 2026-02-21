@@ -12,29 +12,94 @@ import pandas as pd
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-REQUIRED_COLUMNS = {"Severity"}
+# Severity column: checked in order, first match wins.
+SEVERITY_COLUMNS = [
+    "severity", "risk", "criticality", "risk rating",
+    "cvss risk", "vulnerability risk", "threat level", "priority",
+]
+
+# Text label → priority. Numeric CVSS scores are handled separately.
+SEVERITY_LABEL_MAP = {
+    "critical": "P1", "crit": "P1",
+    "high":     "P2",
+    "medium":   "P3", "med": "P3", "moderate": "P3",
+    "low":      "P4",
+    "none":     None, "info": None, "informational": None,
+}
 
 # Columns searched (case-insensitive) when applying asset map overrides.
-ASSET_COLUMNS = {"asset", "host", "asset name", "hostname", "dns name"}
+ASSET_COLUMNS = {"asset", "host", "asset name", "hostname", "dns name", "ip address", "fqdn"}
 
 # Columns searched (case-insensitive) when applying exceptions.
-EXCEPTION_COLUMNS = {"plugin id", "plugin_id", "vulnerability id", "cve", "name"}
+EXCEPTION_COLUMNS = {"plugin id", "plugin_id", "vulnerability id", "cve", "name", "finding id"}
 
 
-def _validate_columns(df: pd.DataFrame, required: set) -> None:
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"CSV is missing required column(s): {', '.join(sorted(missing))}")
+def _detect_severity_col(df: pd.DataFrame, override: str | None) -> str:
+    """Return the severity column name to use, or exit if not found."""
+    if override:
+        if override not in df.columns:
+            log.error(f"Specified severity column '{override}' not found. Available: {list(df.columns)}")
+            sys.exit(1)
+        log.info(f"Severity column: '{override}' (user-specified).")
+        return override
+
+    col = next((c for c in df.columns if c.lower() in SEVERITY_COLUMNS), None)
+    if col is None:
+        log.error(
+            f"Could not detect a severity column. Tried: {SEVERITY_COLUMNS}. "
+            f"Available columns: {list(df.columns)}. "
+            f"Use --severity-col to specify it explicitly."
+        )
+        sys.exit(1)
+
+    log.info(f"Severity column: '{col}' (auto-detected).")
+    return col
 
 
-def _apply_priority(df: pd.DataFrame) -> pd.Series:
-    conditions = [
-        df["Severity"].str.strip().str.lower() == "critical",
-        df["Severity"].str.strip().str.lower() == "high",
-        df["Severity"].str.strip().str.lower() == "medium",
-        df["Severity"].str.strip().str.lower() == "low",
-    ]
-    return pd.Series(np.select(conditions, ["P1", "P2", "P3", "P4"], default="P4"), index=df.index)
+def _normalize_severity(value: str) -> str | None:
+    """Map a raw severity value to a priority string, or None to skip the row."""
+    if pd.isna(value):
+        return None
+
+    val = str(value).strip().lower()
+
+    # 1. Exact text label match ("critical", "high", etc.)
+    if val in SEVERITY_LABEL_MAP:
+        return SEVERITY_LABEL_MAP[val]
+
+    # 2. Try as a pure CVSS numeric score before substring matching,
+    #    so "5.3" is treated as a float and not substring-matched against "3".
+    try:
+        score = float(val)
+        if score >= 9.0:
+            return "P1"
+        if score >= 7.0:
+            return "P2"
+        if score >= 4.0:
+            return "P3"
+        if score > 0.0:
+            return "P4"
+        return None  # CVSS 0 = informational
+    except ValueError:
+        pass
+
+    # 3. Substring match for prefixed formats like "4 - Critical" or "High (3)".
+    for label, priority in SEVERITY_LABEL_MAP.items():
+        if label in val:
+            return priority
+
+    # 4. Unknown value — default to P4.
+    return "P4"
+
+
+def _apply_priority(df: pd.DataFrame, sev_col: str) -> pd.DataFrame:
+    df["Priority"] = df[sev_col].apply(_normalize_severity)
+
+    skipped = df["Priority"].isna().sum()
+    if skipped:
+        log.info(f"Skipped {skipped} row(s) with no actionable severity (None/Info/0).")
+    df = df[df["Priority"].notna()].copy()
+    return df
 
 
 def _apply_asset_map(df: pd.DataFrame, asset_map: dict) -> pd.DataFrame:
@@ -84,6 +149,7 @@ def triage_vulnerabilities(
     asset_map_file: str | None,
     exceptions_file: str | None,
     output_dir: str,
+    severity_col_override: str | None,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -97,14 +163,15 @@ def triage_vulnerabilities(
         log.error(f"Failed to read CSV: {exc}")
         sys.exit(1)
 
-    try:
-        _validate_columns(df, REQUIRED_COLUMNS)
-    except ValueError as exc:
-        log.error(str(exc))
+    if df.empty:
+        log.error("CSV file is empty.")
         sys.exit(1)
 
+    # Detect severity column
+    sev_col = _detect_severity_col(df, severity_col_override)
+
     # Assign base priority from severity
-    df["Priority"] = _apply_priority(df)
+    df = _apply_priority(df, sev_col)
 
     # Apply optional asset map overrides
     if asset_map_file:
@@ -160,6 +227,7 @@ def triage_vulnerabilities(
     summary = {
         "run_time": run_time,
         "source": csv_file,
+        "severity_column": sev_col,
         "total_vulnerabilities": len(df),
         "priority_counts": counts,
     }
@@ -178,6 +246,15 @@ if __name__ == "__main__":
         description="Triage Tenable.io vulnerabilities from a ServiceNow export.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Severity column auto-detection:
+  Looks for: Severity, Risk, Criticality, Risk Rating, CVSS Risk, Threat Level.
+  Use --severity-col if your export uses a different name.
+
+Severity value support:
+  Text:    Critical / High / Medium / Low (case-insensitive)
+  Numeric: CVSS scores (0-10) mapped to P1-P4
+  Prefixed: "4 - Critical", "High (3)", etc.
+
 Asset map format (JSON object):
   {"web-server-01": "P1", "legacy-db": "P2"}
 
@@ -193,6 +270,17 @@ Exceptions format (JSON array):
         default=".",
         help="Directory to write output files (default: current directory).",
     )
+    parser.add_argument(
+        "--severity-col",
+        default=None,
+        help="Name of the severity column if auto-detection fails.",
+    )
     args = parser.parse_args()
 
-    triage_vulnerabilities(args.csv_file, args.asset_map, args.exceptions, args.output_dir)
+    triage_vulnerabilities(
+        args.csv_file,
+        args.asset_map,
+        args.exceptions,
+        args.output_dir,
+        args.severity_col,
+    )
