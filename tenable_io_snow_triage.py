@@ -1,8 +1,10 @@
 
 import argparse
-import pandas as pd
 import json
+import numpy as np
+import pandas as pd
 from datetime import datetime
+
 
 def triage_vulnerabilities(csv_file, asset_map_file, exceptions_file):
     """
@@ -15,10 +17,10 @@ def triage_vulnerabilities(csv_file, asset_map_file, exceptions_file):
         (df['Severity'] == 'Critical'),
         (df['Severity'] == 'High'),
         (df['Severity'] == 'Medium'),
-        (df['Severity'] == 'Low')
+        (df['Severity'] == 'Low'),
     ]
     priorities = ['P1', 'P2', 'P3', 'P4']
-    df['Priority'] = pd.np.select(conditions, priorities, default='P4')
+    df['Priority'] = np.select(conditions, priorities, default='P4')
 
     if asset_map_file:
         with open(asset_map_file, 'r') as f:
@@ -50,24 +52,14 @@ def triage_vulnerabilities(csv_file, asset_map_file, exceptions_file):
     }
 
     with open(summary_md_file, 'w') as f:
-        f.write("# Vulnerability Triage Summary
-
-")
-        f.write(f"Run Time: {run_time}
-")
-        f.write(f"Total Vulnerabilities: {summary['total_vulnerabilities']}
-
-")
-        f.write("## Priority Counts
-")
-        f.write(f"- P1: {summary['p1_count']}
-")
-        f.write(f"- P2: {summary['p2_count']}
-")
-        f.write(f"- P3: {summary['p3_count']}
-")
-        f.write(f"- P4: {summary['p4_count']}
-")
+        f.write("# Vulnerability Triage Summary\n\n")
+        f.write(f"Run Time: {run_time}\n")
+        f.write(f"Total Vulnerabilities: {summary['total_vulnerabilities']}\n\n")
+        f.write("## Priority Counts\n")
+        f.write(f"- P1: {summary['p1_count']}\n")
+        f.write(f"- P2: {summary['p2_count']}\n")
+        f.write(f"- P3: {summary['p3_count']}\n")
+        f.write(f"- P4: {summary['p4_count']}\n")
 
     with open(triage_run_json_file, 'w') as f:
         json.dump(summary, f, indent=4)
@@ -76,6 +68,7 @@ def triage_vulnerabilities(csv_file, asset_map_file, exceptions_file):
     print(f"- {triaged_csv_file}")
     print(f"- {summary_md_file}")
     print(f"- {triage_run_json_file}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Triage Tenable.io vulnerabilities from ServiceNow.')
