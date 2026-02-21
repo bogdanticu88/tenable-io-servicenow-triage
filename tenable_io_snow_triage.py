@@ -58,18 +58,24 @@ def _apply_asset_map(df: pd.DataFrame, asset_map: dict) -> pd.DataFrame:
 def _apply_exceptions(df: pd.DataFrame, exceptions: list) -> pd.DataFrame:
     """Exclude rows whose identifier matches an entry in the exceptions list.
 
+    Matches against all detected identifier columns (Plugin ID, CVE, Name, etc.)
+    so a mixed list of Plugin IDs and CVEs works as expected.
+
     exceptions format: ["<plugin id or name>", ...]
     Example: ["12345", "67890", "CVE-2023-1234"]
     """
-    col = next((c for c in df.columns if c.lower() in EXCEPTION_COLUMNS), None)
-    if col is None:
+    cols = [c for c in df.columns if c.lower() in EXCEPTION_COLUMNS]
+    if not cols:
         log.warning("Exceptions file provided but no matching identifier column found in CSV — skipping.")
         return df
 
     exc_set = {str(e) for e in exceptions}
     before = len(df)
-    df = df[~df[col].astype(str).isin(exc_set)]
-    log.info(f"Exceptions: removed {before - len(df)} row(s) matched against column '{col}'.")
+    mask = pd.Series(False, index=df.index)
+    for col in cols:
+        mask |= df[col].astype(str).isin(exc_set)
+    df = df[~mask]
+    log.info(f"Exceptions: removed {before - len(df)} row(s) matched against column(s): {', '.join(cols)}.")
     return df
 
 
