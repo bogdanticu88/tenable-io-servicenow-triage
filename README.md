@@ -8,13 +8,14 @@ Security teams often struggle with a high volume of vulnerabilities from Tenable
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.10+
 - pandas
+- numpy
 
 ## Installation
 
 ```bash
-pip install pandas
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -23,29 +24,68 @@ pip install pandas
 python tenable_io_snow_triage.py <path_to_your_servicenow_export.csv>
 ```
 
-### Optional Arguments
+### Options
 
-- `--asset-map <path_to_asset_map.json>`: Apply custom asset priority mappings.
-- `--exceptions <path_to_exceptions.json>`: Exclude vulnerabilities based on a predefined list.
+| Flag | Description |
+|------|-------------|
+| `--asset-map <file>` | JSON file mapping asset names to priority overrides |
+| `--exceptions <file>` | JSON file listing Plugin IDs or CVEs to exclude |
+| `--output-dir <dir>` | Directory to write output files (default: current directory) |
 
 ### Examples
 
-**Basic Triage:**
+**Basic triage:**
 
 ```bash
 python tenable_io_snow_triage.py vulnerabilities.csv
 ```
 
-**Triage with Asset Map and Exceptions:**
+**Triage with asset map and exceptions, writing to a specific directory:**
 
 ```bash
-python tenable_io_snow_triage.py vulnerabilities.csv --asset-map assets.json --exceptions exceptions.json
+python tenable_io_snow_triage.py vulnerabilities.csv \
+  --asset-map assets.json \
+  --exceptions exceptions.json \
+  --output-dir ./reports/2024-01-15
+```
+
+## Asset Map Format
+
+A JSON object mapping asset names (matched against any host/asset column in the CSV) to a priority level. Use this to elevate or downgrade priority for specific assets regardless of vulnerability severity.
+
+```json
+{
+  "web-server-01": "P1",
+  "legacy-db": "P2",
+  "dev-sandbox": "P4"
+}
+```
+
+## Exceptions Format
+
+A JSON array of identifiers to exclude from the output. Matched against Plugin ID, CVE, or Name columns if present.
+
+```json
+["12345", "67890", "CVE-2023-1234"]
 ```
 
 ## Output
 
-The tool generates three files:
+Three files are written to the output directory:
 
-- `triaged.csv`: The original CSV data with an added `Priority` column (P1, P2, P3, P4).
-- `summary.md`: A human-readable Markdown summary of the triage run, including vulnerability counts by priority.
-- `triage_run.json`: A machine-readable JSON file containing the summary data, useful for automation and integration with other tools.
+| File | Description |
+|------|-------------|
+| `triaged.csv` | Original CSV with an added `Priority` column (P1–P4) |
+| `summary.md` | Markdown summary with vulnerability counts by priority |
+| `triage_run.json` | Machine-readable JSON summary for automation and integration |
+
+### Priority Mapping
+
+| Severity | Priority |
+|----------|----------|
+| Critical | P1 |
+| High | P2 |
+| Medium | P3 |
+| Low | P4 |
+
+Asset map overrides are applied after the severity-based assignment. Exceptions are removed before output is written.
