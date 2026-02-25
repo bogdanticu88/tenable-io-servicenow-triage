@@ -1,10 +1,10 @@
 # tenable-io-servicenow-triage
 
-Triage Tenable.io vulnerabilities exported from ServiceNow into P1–P4 priorities with SLA tracking, age analysis, asset breakdowns, and audit-ready reports.
+Triage Tenable.io vulnerabilities exported from ServiceNow into P1–P4 priorities with SLA tracking, age analysis, asset breakdowns, threat intelligence enrichment, and audit-ready reports.
 
 ## Why
 
-Security teams dealing with high-volume Tenable.io exports from ServiceNow need more than a simple priority label. This tool provides a full triage workflow: consistent priority assignment, SLA due dates, age and overdue tracking, deduplication stats, asset-level breakdowns, and clean reports in both Markdown and HTML.
+Security teams dealing with high-volume Tenable.io exports from ServiceNow need more than a simple priority label. This tool provides a full triage workflow: consistent priority assignment, SLA due dates, age and overdue tracking, deduplication stats, asset-level breakdowns, threat intelligence enrichment (EPSS, CISA KEV), and clean reports in both Markdown and HTML.
 
 ## Requirements
 
@@ -38,6 +38,8 @@ python tenable_io_snow_triage.py <path_to_export.csv> [options]
 | `--sla-p2 <days>` | `30` | Remediation SLA in days for P2 High |
 | `--sla-p3 <days>` | `90` | Remediation SLA in days for P3 Medium |
 | `--sla-p4 <days>` | `180` | Remediation SLA in days for P4 Low |
+| `--epss` | — | Fetch EPSS scores from FIRST.org API |
+| `--kev` | — | Fetch CISA Known Exploited Vulnerabilities catalog |
 | `--dry-run` | — | Preview mode: process CSV without writing files |
 | `--verbose`, `-v` | — | Enable debug logging output |
 
@@ -49,7 +51,7 @@ python tenable_io_snow_triage.py <path_to_export.csv> [options]
 python tenable_io_snow_triage.py vulnerabilities.csv
 ```
 
-**Full triage with asset overrides, exceptions, custom SLAs:**
+**Full triage with asset overrides, exceptions, and custom SLAs:**
 
 ```bash
 python tenable_io_snow_triage.py vulnerabilities.csv \
@@ -58,6 +60,12 @@ python tenable_io_snow_triage.py vulnerabilities.csv \
   --output-dir ./reports/2024-01-15 \
   --sla-p1 3 \
   --format all
+```
+
+**With threat intelligence enrichment:**
+
+```bash
+python tenable_io_snow_triage.py vulnerabilities.csv --epss --kev
 ```
 
 **Preview mode (dry run):**
@@ -119,6 +127,43 @@ Values are normalized automatically regardless of format:
 
 Asset map overrides are applied after the severity-based assignment. Exceptions are removed before any output is written.
 
+## Threat Intelligence Enrichment
+
+### EPSS Scores
+
+EPSS (Exploit Prediction Scoring System) estimates the likelihood that a vulnerability will be exploited in the wild. Scores range from 0 to 1, with higher scores indicating greater exploitation probability.
+
+**Usage:** `--epss`
+
+**Output columns:**
+- `EPSS Score` — Probability score (0.0–1.0)
+
+**Data source:** [FIRST.org EPSS API](https://www.first.org/epss/)
+
+### CISA KEV Catalog
+
+The CISA Known Exploited Vulnerabilities catalog lists vulnerabilities that are actively being exploited in the wild. These vulnerabilities require immediate attention.
+
+**Usage:** `--kev`
+
+**Output columns:**
+- `In CISA KEV` — Boolean flag (True/False)
+
+**Data source:** [CISA KEV Feed](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+
+### Combined Usage
+
+Using both EPSS and KEV together provides threat-informed prioritization:
+
+```bash
+python tenable_io_snow_triage.py vulnerabilities.csv --epss --kev
+```
+
+This enriches your triage with:
+- Exploitation likelihood scores (EPSS)
+- Active exploitation flags (CISA KEV)
+- Summary statistics for both in reports
+
 ## Asset Map Format
 
 A JSON object mapping asset names to a priority level. Matched against any host, hostname, or asset name column in the CSV.
@@ -152,9 +197,9 @@ This requires no configuration — the column is detected automatically.
 
 | File | Written when | Description |
 |------|-------------|-------------|
-| `triaged.csv` | Always | Original CSV with `Priority`, `Triage Reason`, `Due Date`, and (if applicable) `Age (days)`, `Overdue` columns added |
-| `summary.md` | `markdown` or `all` | Markdown report with priority breakdown, coverage stats, overdue counts, top assets, and top vulnerabilities |
-| `report.html` | `html` or `all` | Self-contained HTML report with summary cards, colour-coded sortable findings table |
+| `triaged.csv` | Always | Original CSV with `Priority`, `Triage Reason`, `Due Date`, and (if applicable) `Age (days)`, `Overdue`, `EPSS Score`, `In CISA KEV` columns added |
+| `summary.md` | `markdown` or `all` | Markdown report with priority breakdown, threat intel stats, coverage stats, overdue counts, top assets, and top vulnerabilities |
+| `report.html` | `html` or `all` | Self-contained HTML report with summary cards, colour-coded sortable findings table, KEV/EPSS highlights |
 | `triage_run.json` | Always | Machine-readable JSON audit record with full processing log |
 
 ### Triage Reason column
@@ -180,6 +225,8 @@ Every row in `triaged.csv` includes a `Triage Reason` column explaining the sour
   "affected_assets": 12,
   "priority_counts": {"P1": 5, "P2": 22, "P3": 89, "P4": 26},
   "overdue": {"P1": 3, "P2": 1, "P3": 0, "P4": 0},
+  "kev_count": 4,
+  "high_epss_count": 12,
   "audit_log": [...]
 }
 ```
@@ -194,16 +241,29 @@ This tool includes several security hardening measures:
 | **Input Validation** | JSON configuration files (asset map, exceptions) are validated before use |
 | **CSV Schema Validation** | Input CSV is validated for required columns before processing |
 | **Output Path Sanitization** | Output files can only be written within the designated output directory |
+| **CSV Injection Protection** | Cell values starting with `=`, `+`, `-`, `@` are escaped to prevent formula injection |
 | **Structured Audit Logging** | All processing steps are logged in JSON format for SIEM integration |
 | **Dry Run Mode** | Preview triage results without writing files |
 | **Pinned Dependencies** | All dependencies are pinned to specific versions for reproducibility |
+| **Granular Exit Codes** | Distinct exit codes for different failure modes (validation, I/O, config, API) |
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 2 | Validation error (invalid input, schema issues) |
+| 3 | I/O error (file not found, permission denied) |
+| 4 | Configuration error (invalid JSON, bad format) |
+| 5 | API error (EPSS/KEV fetch failed) |
 
 ### Security Considerations
 
-- **No network calls**: This tool operates entirely on local files
+- **No network calls**: This tool operates entirely on local files (unless `--epss` or `--kev` is used)
 - **No secrets management**: No API keys or credentials are stored or transmitted
 - **HTML escaping**: All user data in HTML reports is properly escaped via Jinja2
 - **Graceful error handling**: Invalid input causes clean exit with descriptive error messages
+- **API resilience**: EPSS/KEV fetch failures are logged but don't halt processing
 
 ## License
 

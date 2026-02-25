@@ -11,19 +11,30 @@ Security hardening applied:
 - Input validation and schema checks
 - Structured audit logging
 - Output path sanitization
+- CSV injection protection
 """
 
 import argparse
 import json
 import logging
-import os
-import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from jinja2 import Template
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Exit codes
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ExitCode:
+    SUCCESS = 0
+    VALIDATION_ERROR = 2
+    IO_ERROR = 3
+    CONFIG_ERROR = 4
+    API_ERROR = 5
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging configuration
@@ -105,6 +116,12 @@ DEFAULT_SLAS = {"P1": 7, "P2": 30, "P3": 90, "P4": 180}
 # Valid priority values
 VALID_PRIORITIES = {"P1", "P2", "P3", "P4"}
 
+# EPSS API endpoint
+EPSS_API_URL = "https://api.first.org/data/v1/epss"
+
+# CISA KEV catalog URL
+CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Security helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -170,6 +187,27 @@ def _sanitize_output_path(path_str: str, output_dir: Path) -> Path:
         )
     
     return resolved
+
+
+def _sanitize_csv_cell(value) -> str:
+    """Prevent CSV formula injection by escaping dangerous prefixes.
+    
+    CSV injection occurs when cell values start with =, +, -, @, or tab/return
+    characters, which can be interpreted as formulas by spreadsheet applications.
+    
+    Args:
+        value: The cell value to sanitize
+    
+    Returns:
+        Sanitized string value with leading apostrophe if needed
+    """
+    if value is None or pd.isna(value):
+        return ""
+    
+    str_val = str(value)
+    if str_val and str_val[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return f"'{str_val}"
+    return str_val
 
 
 def _validate_csv_schema(df: pd.DataFrame) -> list:
@@ -259,6 +297,131 @@ def _validate_exceptions(exceptions: list) -> list:
     return errors
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Threat intelligence helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _fetch_epss_scores(cve_list: list[str]) -> dict[str, float]:
+    """Fetch EPSS scores for a list of CVEs.
+    
+    Args:
+        cve_list: List of CVE identifiers
+    
+    Returns:
+        Dictionary mapping CVE to EPSS score
+    """
+    if not cve_list:
+        return {}
+    
+    try:
+        import urllib.request
+        import ssl
+        
+        # Build URL with CVE parameters
+        cve_params = "&".join(f"cve={cve}" for cve in cve_list)
+        url = f"{EPSS_API_URL}?{cve_params}"
+        
+        # Create SSL context that verifies certificates
+        ctx = ssl.create_default_context()
+        
+        # Fetch data
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+            data = json.loads(response.read().decode())
+        
+        # Parse results
+        epss_scores = {}
+        for item in data.get("data", []):
+            cve = item.get("cve")
+            score = item.get("epss")
+            if cve and score is not None:
+                epss_scores[cve] = float(score)
+        
+        log.debug(f"Fetched EPSS scores for {len(epss_scores)} CVEs")
+        return epss_scores
+        
+    except Exception as e:
+        log.warning(f"Failed to fetch EPSS scores: {e}")
+        return {}
+
+
+def _fetch_cisa_kev() -> set[str]:
+    """Fetch CISA Known Exploited Vulnerabilities catalog.
+    
+    Returns:
+        Set of CVE IDs that are in the CISA KEV catalog
+    """
+    try:
+        import urllib.request
+        import ssl
+        
+        # Create SSL context that verifies certificates
+        ctx = ssl.create_default_context()
+        
+        # Fetch catalog
+        req = urllib.request.Request(
+            CISA_KEV_URL,
+            headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+            data = json.loads(response.read().decode())
+        
+        # Extract CVE IDs
+        kev_cves = {
+            vuln.get("cveID")
+            for vuln in data.get("vulnerabilities", [])
+            if vuln.get("cveID")
+        }
+        
+        log.debug(f"Fetched CISA KEV catalog: {len(kev_cves)} vulnerabilities")
+        return kev_cves
+        
+    except Exception as e:
+        log.warning(f"Failed to fetch CISA KEV catalog: {e}")
+        return set()
+
+
+def _add_threat_intel(df: pd.DataFrame, fetch_epss: bool, fetch_kev: bool) -> pd.DataFrame:
+    """Add EPSS scores and CISA KEV flags to the DataFrame.
+    
+    Args:
+        df: The DataFrame to enrich
+        fetch_epss: Whether to fetch EPSS scores
+        fetch_kev: Whether to fetch CISA KEV catalog
+    
+    Returns:
+        Enriched DataFrame with EPSS and KEV columns
+    """
+    df = df.copy()
+    
+    # Extract CVE column
+    cve_col = next((c for c in df.columns if c.lower() == "cve"), None)
+    
+    if cve_col is None:
+        log.debug("No CVE column found, skipping threat intel enrichment")
+        return df
+    
+    # Get unique CVEs
+    cve_list = df[cve_col].dropna().unique().tolist()
+    
+    # Fetch EPSS scores
+    if fetch_epss and cve_list:
+        log.info("Fetching EPSS scores...")
+        epss_scores = _fetch_epss_scores(cve_list)
+        df["EPSS Score"] = df[cve_col].map(epss_scores)
+        epss_count = df["EPSS Score"].notna().sum()
+        log.info(f"Added EPSS scores for {epss_count} vulnerabilities")
+    
+    # Fetch CISA KEV
+    if fetch_kev:
+        log.info("Fetching CISA KEV catalog...")
+        kev_cves = _fetch_cisa_kev()
+        df["In CISA KEV"] = df[cve_col].isin(kev_cves)
+        kev_count = df["In CISA KEV"].sum()
+        log.info(f"Found {kev_count} vulnerabilities in CISA KEV catalog")
+    
+    return df
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Detection helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -270,7 +433,7 @@ def _detect_severity_col(df: pd.DataFrame, override: str | None) -> str:
                 f"Specified severity column '{override}' not found.",
                 available_columns=list(df.columns)
             )
-            sys.exit(1)
+            sys.exit(ExitCode.VALIDATION_ERROR)
         log.debug(f"Severity column: '{override}' (user-specified).")
         return override
 
@@ -281,7 +444,7 @@ def _detect_severity_col(df: pd.DataFrame, override: str | None) -> str:
             tried_columns=SEVERITY_COLUMNS,
             available_columns=list(df.columns)
         )
-        sys.exit(1)
+        sys.exit(ExitCode.VALIDATION_ERROR)
 
     log.debug(f"Severity column: '{col}' (auto-detected).")
     return col
@@ -464,6 +627,16 @@ def _compute_stats(df: pd.DataFrame) -> dict:
         }
         overdue_total = sum(overdue_by_priority.values())
 
+    # CISA KEV count
+    kev_count = None
+    if "In CISA KEV" in df.columns:
+        kev_count = int(df["In CISA KEV"].sum())
+
+    # High EPSS count (> 0.5)
+    high_epss_count = None
+    if "EPSS Score" in df.columns:
+        high_epss_count = int((df["EPSS Score"] > 0.5).sum())
+
     # Top 10 affected assets: asset | P1 | P2 | P3 | P4 | Total
     top_assets = None
     if asset_col and total > 0:
@@ -503,6 +676,8 @@ def _compute_stats(df: pd.DataFrame) -> dict:
         "affected_assets": affected_assets,
         "overdue_by_priority": overdue_by_priority,
         "overdue_total": overdue_total,
+        "kev_count": kev_count,
+        "high_epss_count": high_epss_count,
         "top_assets": top_assets,
         "top_vulns": top_vulns,
     }
@@ -546,7 +721,18 @@ def _write_summary_md(
     lines.append(f"| **Total** | | | **{stats['total']}** |")
     lines.append("")
 
-    # 3. Deduplication / coverage stats
+    # 3. Threat intelligence
+    if stats["kev_count"] is not None or stats["high_epss_count"] is not None:
+        lines.append("## Threat Intelligence\n")
+        lines.append("| Metric | Value |")
+        lines.append("|--------|-------|")
+        if stats["kev_count"] is not None:
+            lines.append(f"| In CISA KEV | {stats['kev_count']} |")
+        if stats["high_epss_count"] is not None:
+            lines.append(f"| High EPSS (>0.5) | {stats['high_epss_count']} |")
+        lines.append("")
+
+    # 4. Deduplication / coverage stats
     lines.append("## Coverage\n")
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
@@ -557,7 +743,7 @@ def _write_summary_md(
         lines.append(f"| Affected assets | {stats['affected_assets']} |")
     lines.append("")
 
-    # 4. Overdue findings
+    # 5. Overdue findings
     if stats["overdue_by_priority"] is not None:
         lines.append("## Overdue Findings\n")
         lines.append("| Priority | Overdue |")
@@ -567,7 +753,7 @@ def _write_summary_md(
         lines.append(f"| **Total** | **{stats['overdue_total']}** |")
         lines.append("")
 
-    # 5. Top 10 affected assets
+    # 6. Top 10 affected assets
     if stats["top_assets"] is not None and len(stats["top_assets"]) > 0:
         lines.append("## Top Affected Assets\n")
         lines.append("| Asset | P1 | P2 | P3 | P4 | Total |")
@@ -579,7 +765,7 @@ def _write_summary_md(
             )
         lines.append("")
 
-    # 6. Top 10 most prevalent vulnerabilities
+    # 7. Top 10 most prevalent vulnerabilities
     if stats["top_vulns"] is not None and len(stats["top_vulns"]) > 0:
         lines.append("## Top Vulnerabilities\n")
         lines.append("| Name / Plugin | Instances | Priority |")
@@ -622,6 +808,8 @@ _HTML_TEMPLATE = """\
     .card.p3     { border-top-color: #eab308; } .card.p3     .value { color: #ca8a04; }
     .card.p4     { border-top-color: #22c55e; } .card.p4     .value { color: #16a34a; }
     .card.overdue { border-top-color: #dc2626; } .card.overdue .value { color: #dc2626; }
+    .card.kev     { border-top-color: #dc2626; } .card.kev     .value { color: #dc2626; }
+    .card.epss    { border-top-color: #f97316; } .card.epss    .value { color: #ea580c; }
     .table-wrap { overflow-x: auto; border-radius: 8px; border: 1px solid #e2e8f0; }
     table { width: 100%; border-collapse: collapse; background: #fff; font-size: 0.78rem; }
     thead { background: #f1f5f9; }
@@ -646,6 +834,7 @@ _HTML_TEMPLATE = """\
     .bp2 { background: #ffedd5; color: #c2410c; }
     .bp3 { background: #fef9c3; color: #854d0e; }
     .bp4 { background: #dcfce7; color: #15803d; }
+    .badge-kev { background: #fee2e2; color: #b91c1c; font-weight: 700; }
   </style>
 </head>
 <body>
@@ -683,6 +872,18 @@ _HTML_TEMPLATE = """\
       <div class="value">{{ stats.overdue_total }}</div>
     </div>
     {% endif %}
+    {% if stats.kev_count is not none %}
+    <div class="card kev">
+      <div class="label">CISA KEV</div>
+      <div class="value">{{ stats.kev_count }}</div>
+    </div>
+    {% endif %}
+    {% if stats.high_epss_count is not none %}
+    <div class="card epss">
+      <div class="label">High EPSS</div>
+      <div class="value">{{ stats.high_epss_count }}</div>
+    </div>
+    {% endif %}
   </div>
 
   <div class="section">
@@ -703,6 +904,8 @@ _HTML_TEMPLATE = """\
             <td title="{{ row[col]|e }}">
               {% if col == 'Priority' %}
               <span class="badge b{{ row[col]|lower|e }}">{{ row[col]|e }}</span>
+              {% elif col == 'In CISA KEV' and row[col] == 'True' %}
+              <span class="badge badge-kev">KEV</span>
               {% else %}
               {{ row[col]|e }}
               {% endif %}
@@ -745,7 +948,7 @@ def _build_html(df: pd.DataFrame, stats: dict, run_time: str, source: str, sev_c
     columns = list(df.columns)
     rows = []
     for _, r in df.iterrows():
-        row = {col: ("" if pd.isna(r[col]) else str(r[col])) for col in columns}
+        row = {col: _sanitize_csv_cell(r[col]) for col in columns}
         css = r["Priority"].lower()  # "p1", "p2", etc.
         if "Overdue" in df.columns and r.get("Overdue") == True:
             css += " overdue"
@@ -763,19 +966,39 @@ def _build_html(df: pd.DataFrame, stats: dict, run_time: str, source: str, sev_c
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# CSV writer with injection protection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _write_csv_safe(df: pd.DataFrame, path: str) -> None:
+    """Write DataFrame to CSV with formula injection protection.
+    
+    Args:
+        df: DataFrame to write
+        path: Output file path
+    """
+    # Create a copy with sanitized values
+    df_safe = df.copy()
+    for col in df_safe.columns:
+        df_safe[col] = df_safe[col].apply(_sanitize_csv_cell)
+    
+    df_safe.to_csv(path, index=False)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
 
 def triage_vulnerabilities(
     csv_file: str,
-    asset_map_file: str | None,
-    exceptions_file: str | None,
+    asset_map_file: Optional[str],
+    exceptions_file: Optional[str],
     output_dir: str,
-    severity_col_override: str | None,
+    severity_col_override: Optional[str],
     slas: dict,
     output_format: str,
     dry_run: bool = False,
     verbose: bool = False,
+    fetch_epss: bool = False,
+    fetch_kev: bool = False,
 ) -> None:
     """Main triage orchestration function.
     
@@ -789,6 +1012,8 @@ def triage_vulnerabilities(
         output_format: Output format (markdown, html, all)
         dry_run: If True, process but don't write files
         verbose: Enable debug logging
+        fetch_epss: If True, fetch EPSS scores from FIRST.org
+        fetch_kev: If True, fetch CISA KEV catalog
     """
     global log
     log = StructuredLogger(verbose=verbose)
@@ -804,11 +1029,11 @@ def triage_vulnerabilities(
         csv_path = _safe_path(csv_file, base_dir, allow_parent=True)
         if not csv_path.exists():
             log.error(f"CSV file not found: {csv_file}")
-            sys.exit(1)
+            sys.exit(ExitCode.IO_ERROR)
         log.debug(f"Input file resolved: {csv_path}")
     except ValueError as e:
         log.error(str(e))
-        sys.exit(1)
+        sys.exit(ExitCode.VALIDATION_ERROR)
     
     # Validate output directory
     try:
@@ -816,7 +1041,7 @@ def triage_vulnerabilities(
         _ = _sanitize_output_path(str(output_path), output_path)
     except (OSError, ValueError) as e:
         log.error(f"Invalid output directory: {e}")
-        sys.exit(1)
+        sys.exit(ExitCode.IO_ERROR)
     
     # Load CSV
     try:
@@ -824,17 +1049,17 @@ def triage_vulnerabilities(
         log.debug(f"Loaded CSV: {len(df)} rows, {len(df.columns)} columns")
     except FileNotFoundError:
         log.error(f"CSV file not found: {csv_file}")
-        sys.exit(1)
+        sys.exit(ExitCode.IO_ERROR)
     except Exception as exc:
         log.error(f"Failed to read CSV: {exc}")
-        sys.exit(1)
+        sys.exit(ExitCode.IO_ERROR)
 
     # Validate CSV schema
     schema_errors = _validate_csv_schema(df)
     if schema_errors:
         for err in schema_errors:
             log.error(f"CSV validation error: {err}")
-        sys.exit(1)
+        sys.exit(ExitCode.VALIDATION_ERROR)
 
     # Detect severity column
     sev_col = _detect_severity_col(df, severity_col_override)
@@ -854,18 +1079,18 @@ def triage_vulnerabilities(
             if validation_errors:
                 for err in validation_errors:
                     log.error(f"Asset map validation: {err}")
-                sys.exit(1)
+                sys.exit(ExitCode.CONFIG_ERROR)
             
             df = _apply_asset_map(df, asset_map)
         except FileNotFoundError:
             log.error(f"Asset map file not found: {asset_map_file}")
-            sys.exit(1)
+            sys.exit(ExitCode.IO_ERROR)
         except json.JSONDecodeError as exc:
             log.error(f"Invalid JSON in asset map: {exc}")
-            sys.exit(1)
+            sys.exit(ExitCode.CONFIG_ERROR)
         except ValueError as e:
             log.error(str(e))
-            sys.exit(1)
+            sys.exit(ExitCode.VALIDATION_ERROR)
 
     # Apply optional exceptions
     if exceptions_file:
@@ -879,18 +1104,22 @@ def triage_vulnerabilities(
             if validation_errors:
                 for err in validation_errors:
                     log.error(f"Exceptions validation: {err}")
-                sys.exit(1)
+                sys.exit(ExitCode.CONFIG_ERROR)
             
             df = _apply_exceptions(df, exceptions)
         except FileNotFoundError:
             log.error(f"Exceptions file not found: {exceptions_file}")
-            sys.exit(1)
+            sys.exit(ExitCode.IO_ERROR)
         except json.JSONDecodeError as exc:
             log.error(f"Invalid JSON in exceptions file: {exc}")
-            sys.exit(1)
+            sys.exit(ExitCode.CONFIG_ERROR)
         except ValueError as e:
             log.error(str(e))
-            sys.exit(1)
+            sys.exit(ExitCode.VALIDATION_ERROR)
+
+    # Add threat intelligence enrichment
+    if fetch_epss or fetch_kev:
+        df = _add_threat_intel(df, fetch_epss, fetch_kev)
 
     # Add SLA due dates
     df = _add_due_dates(df, slas, date.today())
@@ -924,9 +1153,13 @@ def triage_vulnerabilities(
               f"P3={stats['counts']['P3']}, P4={stats['counts']['P4']}")
         if stats["overdue_total"]:
             print(f"  Overdue: {stats['overdue_total']}")
+        if stats["kev_count"]:
+            print(f"  In CISA KEV: {stats['kev_count']}")
+        if stats["high_epss_count"]:
+            print(f"  High EPSS (>0.5): {stats['high_epss_count']}")
     else:
         # Write output files
-        df.to_csv(triaged_csv, index=False)
+        _write_csv_safe(df, triaged_csv)
 
         # summary.md
         if output_format in ("markdown", "all"):
@@ -949,6 +1182,8 @@ def triage_vulnerabilities(
             "affected_assets": stats["affected_assets"],
             "priority_counts": stats["counts"],
             "overdue": stats["overdue_by_priority"],
+            "kev_count": stats["kev_count"],
+            "high_epss_count": stats["high_epss_count"],
             "audit_log": log.get_audit_log(),
         }
         with open(triage_json, "w", encoding="utf-8") as f:
@@ -1000,7 +1235,12 @@ Security features:
   - Path traversal prevention for all file operations
   - Input validation for JSON configuration files
   - CSV schema validation before processing
+  - CSV formula injection protection
   - Structured audit logging in JSON output
+
+Threat intelligence:
+  - EPSS scores from FIRST.org (exploitation likelihood)
+  - CISA KEV catalog (known exploited vulnerabilities)
 """,
     )
 
@@ -1071,6 +1311,16 @@ Security features:
         action="store_true",
         help="Enable verbose/debug logging output."
     )
+    parser.add_argument(
+        "--epss",
+        action="store_true",
+        help="Fetch EPSS scores from FIRST.org API for exploitation likelihood."
+    )
+    parser.add_argument(
+        "--kev",
+        action="store_true",
+        help="Fetch CISA Known Exploited Vulnerabilities catalog and flag matching CVEs."
+    )
 
     args = parser.parse_args()
 
@@ -1091,4 +1341,6 @@ Security features:
         args.output_format,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        fetch_epss=args.epss,
+        fetch_kev=args.kev,
     )
