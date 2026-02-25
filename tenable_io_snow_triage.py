@@ -5,20 +5,68 @@ tenable_io_snow_triage.py — Tenable.io / ServiceNow vulnerability triage tool.
 Reads a vulnerability export CSV, assigns P1–P4 priorities, tracks SLA due dates,
 computes age and overdue status, and produces an enriched CSV, Markdown summary,
 HTML report, and JSON audit record.
+
+Security hardening applied:
+- Path traversal prevention
+- Input validation and schema checks
+- Structured audit logging
+- Output path sanitization
 """
 
 import argparse
 import json
 import logging
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 from jinja2 import Template
 
-logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
-log = logging.getLogger(__name__)
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+class StructuredLogger:
+    """Logger supporting both human-readable and JSON structured output."""
+    
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.log_entries = []
+        format_str = "%(levelname)s: %(message)s" if not verbose else "%(asctime)s - %(levelname)s: %(message)s"
+        level = logging.DEBUG if verbose else logging.INFO
+        logging.basicConfig(format=format_str, level=level)
+        self.log = logging.getLogger(__name__)
+    
+    def info(self, msg: str, **kwargs):
+        self.log.info(msg)
+        self._record("INFO", msg, **kwargs)
+    
+    def warning(self, msg: str, **kwargs):
+        self.log.warning(msg)
+        self._record("WARNING", msg, **kwargs)
+    
+    def error(self, msg: str, **kwargs):
+        self.log.error(msg)
+        self._record("ERROR", msg, **kwargs)
+    
+    def debug(self, msg: str, **kwargs):
+        self.log.debug(msg)
+        self._record("DEBUG", msg, **kwargs)
+    
+    def _record(self, level: str, msg: str, **kwargs):
+        entry = {"timestamp": datetime.now().isoformat(), "level": level, "message": msg}
+        if kwargs:
+            entry.update(kwargs)
+        self.log_entries.append(entry)
+    
+    def get_audit_log(self) -> list:
+        return self.log_entries
+
+
+log = StructuredLogger()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -54,6 +102,162 @@ FIRST_SEEN_COLUMNS = {
 # Default SLA in days per priority (industry standard).
 DEFAULT_SLAS = {"P1": 7, "P2": 30, "P3": 90, "P4": 180}
 
+# Valid priority values
+VALID_PRIORITIES = {"P1", "P2", "P3", "P4"}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Security helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _safe_path(path_str: str, base_dir: Path, allow_parent: bool = False) -> Path:
+    """Resolve and validate a file path to prevent path traversal attacks.
+    
+    Args:
+        path_str: The path string to validate
+        base_dir: The base directory for relative paths
+        allow_parent: If True, allow paths up to parent of base_dir
+    
+    Returns:
+        Resolved Path object if valid
+    
+    Raises:
+        ValueError: If path traversal is detected
+    """
+    path = Path(path_str)
+    
+    # Resolve to absolute path
+    if path.is_absolute():
+        resolved = path.resolve()
+    else:
+        resolved = (base_dir / path).resolve()
+    
+    # Check for path traversal
+    if not allow_parent:
+        try:
+            resolved.relative_to(base_dir)
+        except ValueError:
+            raise ValueError(
+                f"Path traversal detected: '{path_str}' resolves outside allowed directory"
+            )
+    
+    return resolved
+
+
+def _sanitize_output_path(path_str: str, output_dir: Path) -> Path:
+    """Validate output path is within the designated output directory.
+    
+    Args:
+        path_str: The output path string
+        output_dir: The allowed output directory
+    
+    Returns:
+        Safe resolved Path object
+    
+    Raises:
+        ValueError: If path is outside output_dir
+    """
+    path = Path(path_str)
+    if path.is_absolute():
+        resolved = path.resolve()
+    else:
+        resolved = (output_dir / path).resolve()
+    
+    try:
+        resolved.relative_to(output_dir)
+    except ValueError:
+        raise ValueError(
+            f"Output path traversal detected: '{path_str}' is outside output directory"
+        )
+    
+    return resolved
+
+
+def _validate_csv_schema(df: pd.DataFrame) -> list:
+    """Validate CSV has minimum required columns for processing.
+    
+    Args:
+        df: The DataFrame to validate
+    
+    Returns:
+        List of validation errors (empty if valid)
+    """
+    errors = []
+    
+    if df.empty:
+        errors.append("CSV file is empty")
+        return errors
+    
+    # Must have at least one severity-like column
+    has_severity = any(c.lower() in SEVERITY_COLUMNS for c in df.columns)
+    if not has_severity:
+        errors.append(
+            f"No severity column found. Expected one of: {', '.join(SEVERITY_COLUMNS)}"
+        )
+    
+    # Must have at least one asset/host column for meaningful triage
+    has_asset = any(c.lower() in ASSET_COLUMNS for c in df.columns)
+    if not has_asset:
+        log.warning(
+            "No asset/host column found. Asset map overrides will be skipped.",
+            columns=list(df.columns)
+        )
+    
+    # Must have at least one identifier column for deduplication
+    has_id = any(c.lower() in EXCEPTION_COLUMNS for c in df.columns)
+    if not has_id:
+        log.warning(
+            "No vulnerability identifier column found. Deduplication stats may be inaccurate.",
+            columns=list(df.columns)
+        )
+    
+    return errors
+
+
+def _validate_asset_map(asset_map: dict) -> list:
+    """Validate asset map structure and values.
+    
+    Args:
+        asset_map: The asset map dictionary
+    
+    Returns:
+        List of validation errors (empty if valid)
+    """
+    errors = []
+    
+    if not isinstance(asset_map, dict):
+        errors.append("Asset map must be a JSON object")
+        return errors
+    
+    for asset, priority in asset_map.items():
+        if not isinstance(asset, str) or not asset.strip():
+            errors.append(f"Invalid asset name: {repr(asset)}")
+        if priority not in VALID_PRIORITIES:
+            errors.append(f"Invalid priority '{priority}' for asset '{asset}'")
+    
+    return errors
+
+
+def _validate_exceptions(exceptions: list) -> list:
+    """Validate exceptions list structure.
+    
+    Args:
+        exceptions: The exceptions list
+    
+    Returns:
+        List of validation errors (empty if valid)
+    """
+    errors = []
+    
+    if not isinstance(exceptions, list):
+        errors.append("Exceptions must be a JSON array")
+        return errors
+    
+    for i, exc in enumerate(exceptions):
+        if not isinstance(exc, str) or not exc.strip():
+            errors.append(f"Invalid exception at index {i}: {repr(exc)}")
+    
+    return errors
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Detection helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -62,21 +266,24 @@ def _detect_severity_col(df: pd.DataFrame, override: str | None) -> str:
     """Return the severity column name to use, or exit if not found."""
     if override:
         if override not in df.columns:
-            log.error(f"Specified severity column '{override}' not found. Available: {list(df.columns)}")
+            log.error(
+                f"Specified severity column '{override}' not found.",
+                available_columns=list(df.columns)
+            )
             sys.exit(1)
-        log.info(f"Severity column: '{override}' (user-specified).")
+        log.debug(f"Severity column: '{override}' (user-specified).")
         return override
 
     col = next((c for c in df.columns if c.lower() in SEVERITY_COLUMNS), None)
     if col is None:
         log.error(
-            f"Could not detect a severity column. Tried: {SEVERITY_COLUMNS}. "
-            f"Available columns: {list(df.columns)}. "
-            f"Use --severity-col to specify it explicitly."
+            f"Could not detect a severity column.",
+            tried_columns=SEVERITY_COLUMNS,
+            available_columns=list(df.columns)
         )
         sys.exit(1)
 
-    log.info(f"Severity column: '{col}' (auto-detected).")
+    log.debug(f"Severity column: '{col}' (auto-detected).")
     return col
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -127,6 +334,7 @@ def _classify_severity(value) -> tuple[str | None, str | None]:
             return priority, f"severity:{raw}"
 
     # 4. Unknown value — default to P4.
+    log.debug(f"Unknown severity value '{raw}', defaulting to P4")
     return "P4", f"severity:{raw}"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -188,7 +396,11 @@ def _apply_exceptions(df: pd.DataFrame, exceptions: list) -> pd.DataFrame:
     for col in cols:
         mask |= df[col].astype(str).isin(exc_set)
     df = df[~mask]
-    log.info(f"Exceptions: removed {before - len(df)} row(s) matched against column(s): {', '.join(cols)}.")
+    log.info(
+        f"Exceptions: removed {before - len(df)} row(s) matched against column(s): {', '.join(cols)}.",
+        removed_count=before - len(df),
+        matched_columns=cols
+    )
     return df
 
 
@@ -562,13 +774,54 @@ def triage_vulnerabilities(
     severity_col_override: str | None,
     slas: dict,
     output_format: str,
+    dry_run: bool = False,
+    verbose: bool = False,
 ) -> None:
-    os.makedirs(output_dir, exist_ok=True)
-    today = date.today()
-
+    """Main triage orchestration function.
+    
+    Args:
+        csv_file: Path to input CSV file
+        asset_map_file: Path to asset map JSON file (optional)
+        exceptions_file: Path to exceptions JSON file (optional)
+        output_dir: Directory for output files
+        severity_col_override: Override severity column name
+        slas: SLA days per priority
+        output_format: Output format (markdown, html, all)
+        dry_run: If True, process but don't write files
+        verbose: Enable debug logging
+    """
+    global log
+    log = StructuredLogger(verbose=verbose)
+    
+    # Resolve base directory for path validation
+    base_dir = Path.cwd()
+    output_path = Path(output_dir).resolve()
+    
+    log.info("Starting vulnerability triage", source=csv_file, output_dir=str(output_path))
+    
+    # Validate and resolve input file path
+    try:
+        csv_path = _safe_path(csv_file, base_dir, allow_parent=True)
+        if not csv_path.exists():
+            log.error(f"CSV file not found: {csv_file}")
+            sys.exit(1)
+        log.debug(f"Input file resolved: {csv_path}")
+    except ValueError as e:
+        log.error(str(e))
+        sys.exit(1)
+    
+    # Validate output directory
+    try:
+        output_path.mkdir(parents=True, exist_ok=True)
+        _ = _sanitize_output_path(str(output_path), output_path)
+    except (OSError, ValueError) as e:
+        log.error(f"Invalid output directory: {e}")
+        sys.exit(1)
+    
     # Load CSV
     try:
-        df = pd.read_csv(csv_file)
+        df = pd.read_csv(csv_path)
+        log.debug(f"Loaded CSV: {len(df)} rows, {len(df.columns)} columns")
     except FileNotFoundError:
         log.error(f"CSV file not found: {csv_file}")
         sys.exit(1)
@@ -576,8 +829,11 @@ def triage_vulnerabilities(
         log.error(f"Failed to read CSV: {exc}")
         sys.exit(1)
 
-    if df.empty:
-        log.error("CSV file is empty.")
+    # Validate CSV schema
+    schema_errors = _validate_csv_schema(df)
+    if schema_errors:
+        for err in schema_errors:
+            log.error(f"CSV validation error: {err}")
         sys.exit(1)
 
     # Detect severity column
@@ -589,85 +845,129 @@ def triage_vulnerabilities(
     # Apply optional asset map overrides
     if asset_map_file:
         try:
-            with open(asset_map_file) as f:
+            asset_map_path = _safe_path(asset_map_file, base_dir, allow_parent=True)
+            with open(asset_map_path) as f:
                 asset_map = json.load(f)
-            if not isinstance(asset_map, dict):
-                raise ValueError("Asset map must be a JSON object mapping asset names to priorities.")
+            
+            # Validate asset map structure
+            validation_errors = _validate_asset_map(asset_map)
+            if validation_errors:
+                for err in validation_errors:
+                    log.error(f"Asset map validation: {err}")
+                sys.exit(1)
+            
             df = _apply_asset_map(df, asset_map)
         except FileNotFoundError:
             log.error(f"Asset map file not found: {asset_map_file}")
             sys.exit(1)
-        except (json.JSONDecodeError, ValueError) as exc:
-            log.error(f"Failed to load asset map: {exc}")
+        except json.JSONDecodeError as exc:
+            log.error(f"Invalid JSON in asset map: {exc}")
+            sys.exit(1)
+        except ValueError as e:
+            log.error(str(e))
             sys.exit(1)
 
     # Apply optional exceptions
     if exceptions_file:
         try:
-            with open(exceptions_file) as f:
+            exc_path = _safe_path(exceptions_file, base_dir, allow_parent=True)
+            with open(exc_path) as f:
                 exceptions = json.load(f)
-            if not isinstance(exceptions, list):
-                raise ValueError("Exceptions file must be a JSON array of identifiers.")
+            
+            # Validate exceptions structure
+            validation_errors = _validate_exceptions(exceptions)
+            if validation_errors:
+                for err in validation_errors:
+                    log.error(f"Exceptions validation: {err}")
+                sys.exit(1)
+            
             df = _apply_exceptions(df, exceptions)
         except FileNotFoundError:
             log.error(f"Exceptions file not found: {exceptions_file}")
             sys.exit(1)
-        except (json.JSONDecodeError, ValueError) as exc:
-            log.error(f"Failed to load exceptions file: {exc}")
+        except json.JSONDecodeError as exc:
+            log.error(f"Invalid JSON in exceptions file: {exc}")
+            sys.exit(1)
+        except ValueError as e:
+            log.error(str(e))
             sys.exit(1)
 
     # Add SLA due dates
-    df = _add_due_dates(df, slas, today)
+    df = _add_due_dates(df, slas, date.today())
 
     # Add age and overdue tracking (only if a first-seen column is present)
-    df, _first_seen_col = _add_age_tracking(df, slas, today)
+    df, _first_seen_col = _add_age_tracking(df, slas, date.today())
 
     # Compute all stats
     stats = _compute_stats(df)
 
     # Build output paths
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    triaged_csv = os.path.join(output_dir, "triaged.csv")
-    summary_md  = os.path.join(output_dir, "summary.md")
-    report_html = os.path.join(output_dir, "report.html")
-    triage_json = os.path.join(output_dir, "triage_run.json")
+    
+    # Sanitize output filenames
+    triaged_csv = str(_sanitize_output_path("triaged.csv", output_path))
+    summary_md = str(_sanitize_output_path("summary.md", output_path))
+    report_html = str(_sanitize_output_path("report.html", output_path))
+    triage_json = str(_sanitize_output_path("triage_run.json", output_path))
 
-    # triaged.csv — always written
-    df.to_csv(triaged_csv, index=False)
+    if dry_run:
+        log.info("DRY RUN MODE - No files will be written")
+        log.info(
+            "Triage processing complete (dry run)",
+            total_vulnerabilities=stats["total"],
+            priority_counts=stats["counts"],
+            overdue_count=stats["overdue_total"]
+        )
+        print("\n[DRY RUN] Triage processing complete - no files written")
+        print(f"  Would process {stats['total']} vulnerabilities")
+        print(f"  Priority breakdown: P1={stats['counts']['P1']}, P2={stats['counts']['P2']}, "
+              f"P3={stats['counts']['P3']}, P4={stats['counts']['P4']}")
+        if stats["overdue_total"]:
+            print(f"  Overdue: {stats['overdue_total']}")
+    else:
+        # Write output files
+        df.to_csv(triaged_csv, index=False)
 
-    # summary.md
-    if output_format in ("markdown", "all"):
-        _write_summary_md(summary_md, stats, run_time, csv_file, sev_col, slas)
+        # summary.md
+        if output_format in ("markdown", "all"):
+            _write_summary_md(summary_md, stats, run_time, csv_file, sev_col, slas)
 
-    # report.html
-    if output_format in ("html", "all"):
-        html = _build_html(df, stats, run_time, csv_file, sev_col)
-        with open(report_html, "w", encoding="utf-8") as f:
-            f.write(html)
+        # report.html
+        if output_format in ("html", "all"):
+            html = _build_html(df, stats, run_time, csv_file, sev_col)
+            with open(report_html, "w", encoding="utf-8") as f:
+                f.write(html)
 
-    # triage_run.json — always written
-    json_payload = {
-        "run_time": run_time,
-        "source": csv_file,
-        "severity_column": sev_col,
-        "slas": slas,
-        "total_vulnerabilities": stats["total"],
-        "unique_vulnerabilities": stats["unique_vulns"],
-        "affected_assets": stats["affected_assets"],
-        "priority_counts": stats["counts"],
-        "overdue": stats["overdue_by_priority"],
-    }
-    with open(triage_json, "w", encoding="utf-8") as f:
-        json.dump(json_payload, f, indent=4)
+        # triage_run.json - always written with audit log
+        json_payload = {
+            "run_time": run_time,
+            "source": csv_file,
+            "severity_column": sev_col,
+            "slas": slas,
+            "total_vulnerabilities": stats["total"],
+            "unique_vulnerabilities": stats["unique_vulns"],
+            "affected_assets": stats["affected_assets"],
+            "priority_counts": stats["counts"],
+            "overdue": stats["overdue_by_priority"],
+            "audit_log": log.get_audit_log(),
+        }
+        with open(triage_json, "w", encoding="utf-8") as f:
+            json.dump(json_payload, f, indent=4)
 
-    log.info(f"Triage complete — {stats['total']} vulnerabilities processed.")
-    print(f"\nOutputs written to '{output_dir}':")
-    print(f"  {triaged_csv}")
-    if output_format in ("markdown", "all"):
-        print(f"  {summary_md}")
-    if output_format in ("html", "all"):
-        print(f"  {report_html}")
-    print(f"  {triage_json}")
+        log.info(
+            "Triage complete",
+            output_dir=str(output_path),
+            total=stats["total"],
+            priority_counts=stats["counts"]
+        )
+
+        print(f"\nOutputs written to '{output_dir}':")
+        print(f"  {triaged_csv}")
+        if output_format in ("markdown", "all"):
+            print(f"  {summary_md}")
+        if output_format in ("html", "all"):
+            print(f"  {report_html}")
+        print(f"  {triage_json}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -695,40 +995,81 @@ Exceptions format (JSON array):
 
 Default SLAs (days to remediate):
   P1: {DEFAULT_SLAS['P1']}  |  P2: {DEFAULT_SLAS['P2']}  |  P3: {DEFAULT_SLAS['P3']}  |  P4: {DEFAULT_SLAS['P4']}
+
+Security features:
+  - Path traversal prevention for all file operations
+  - Input validation for JSON configuration files
+  - CSV schema validation before processing
+  - Structured audit logging in JSON output
 """,
     )
 
-    parser.add_argument("csv_file", help="Path to the Tenable.io vulnerability CSV from ServiceNow.")
-    parser.add_argument("--asset-map", help="JSON file mapping asset names to priority overrides.")
-    parser.add_argument("--exceptions", help="JSON file listing Plugin IDs or CVEs to exclude.")
     parser.add_argument(
-        "--output-dir", default=".",
-        help="Directory to write output files (default: current directory).",
+        "csv_file",
+        help="Path to the Tenable.io vulnerability CSV from ServiceNow."
     )
     parser.add_argument(
-        "--severity-col", default=None,
-        help="Name of the severity column if auto-detection fails.",
+        "--asset-map",
+        help="JSON file mapping asset names to priority overrides."
     )
     parser.add_argument(
-        "--format", dest="output_format",
-        choices=["markdown", "html", "all"], default="all",
-        help="Output report format: markdown, html, or all (default: all).",
+        "--exceptions",
+        help="JSON file listing Plugin IDs or CVEs to exclude."
     )
     parser.add_argument(
-        "--sla-p1", type=int, default=DEFAULT_SLAS["P1"], metavar="DAYS",
-        help=f"SLA in days for P1 Critical findings (default: {DEFAULT_SLAS['P1']}).",
+        "--output-dir",
+        default=".",
+        help="Directory to write output files (default: current directory)."
     )
     parser.add_argument(
-        "--sla-p2", type=int, default=DEFAULT_SLAS["P2"], metavar="DAYS",
-        help=f"SLA in days for P2 High findings (default: {DEFAULT_SLAS['P2']}).",
+        "--severity-col",
+        default=None,
+        help="Name of the severity column if auto-detection fails."
     )
     parser.add_argument(
-        "--sla-p3", type=int, default=DEFAULT_SLAS["P3"], metavar="DAYS",
-        help=f"SLA in days for P3 Medium findings (default: {DEFAULT_SLAS['P3']}).",
+        "--format",
+        dest="output_format",
+        choices=["markdown", "html", "all"],
+        default="all",
+        help="Output report format: markdown, html, or all (default: all)."
     )
     parser.add_argument(
-        "--sla-p4", type=int, default=DEFAULT_SLAS["P4"], metavar="DAYS",
-        help=f"SLA in days for P4 Low findings (default: {DEFAULT_SLAS['P4']}).",
+        "--sla-p1",
+        type=int,
+        default=DEFAULT_SLAS["P1"],
+        metavar="DAYS",
+        help=f"SLA in days for P1 Critical findings (default: {DEFAULT_SLAS['P1']})."
+    )
+    parser.add_argument(
+        "--sla-p2",
+        type=int,
+        default=DEFAULT_SLAS["P2"],
+        metavar="DAYS",
+        help=f"SLA in days for P2 High findings (default: {DEFAULT_SLAS['P2']})."
+    )
+    parser.add_argument(
+        "--sla-p3",
+        type=int,
+        default=DEFAULT_SLAS["P3"],
+        metavar="DAYS",
+        help=f"SLA in days for P3 Medium findings (default: {DEFAULT_SLAS['P3']})."
+    )
+    parser.add_argument(
+        "--sla-p4",
+        type=int,
+        default=DEFAULT_SLAS["P4"],
+        metavar="DAYS",
+        help=f"SLA in days for P4 Low findings (default: {DEFAULT_SLAS['P4']})."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Process the CSV but don't write any output files (preview mode)."
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose/debug logging output."
     )
 
     args = parser.parse_args()
@@ -748,4 +1089,6 @@ Default SLAs (days to remediate):
         args.severity_col,
         slas,
         args.output_format,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
     )

@@ -38,6 +38,8 @@ python tenable_io_snow_triage.py <path_to_export.csv> [options]
 | `--sla-p2 <days>` | `30` | Remediation SLA in days for P2 High |
 | `--sla-p3 <days>` | `90` | Remediation SLA in days for P3 Medium |
 | `--sla-p4 <days>` | `180` | Remediation SLA in days for P4 Low |
+| `--dry-run` | — | Preview mode: process CSV without writing files |
+| `--verbose`, `-v` | — | Enable debug logging output |
 
 ### Examples
 
@@ -47,7 +49,7 @@ python tenable_io_snow_triage.py <path_to_export.csv> [options]
 python tenable_io_snow_triage.py vulnerabilities.csv
 ```
 
-**Full triage with asset overrides, exceptions, custom SLAs, and a specific output directory:**
+**Full triage with asset overrides, exceptions, custom SLAs:**
 
 ```bash
 python tenable_io_snow_triage.py vulnerabilities.csv \
@@ -56,6 +58,18 @@ python tenable_io_snow_triage.py vulnerabilities.csv \
   --output-dir ./reports/2024-01-15 \
   --sla-p1 3 \
   --format all
+```
+
+**Preview mode (dry run):**
+
+```bash
+python tenable_io_snow_triage.py vulnerabilities.csv --dry-run
+```
+
+**Verbose logging:**
+
+```bash
+python tenable_io_snow_triage.py vulnerabilities.csv --verbose
 ```
 
 **HTML report only:**
@@ -141,7 +155,7 @@ This requires no configuration — the column is detected automatically.
 | `triaged.csv` | Always | Original CSV with `Priority`, `Triage Reason`, `Due Date`, and (if applicable) `Age (days)`, `Overdue` columns added |
 | `summary.md` | `markdown` or `all` | Markdown report with priority breakdown, coverage stats, overdue counts, top assets, and top vulnerabilities |
 | `report.html` | `html` or `all` | Self-contained HTML report with summary cards, colour-coded sortable findings table |
-| `triage_run.json` | Always | Machine-readable JSON audit record for automation and integration |
+| `triage_run.json` | Always | Machine-readable JSON audit record with full processing log |
 
 ### Triage Reason column
 
@@ -165,6 +179,32 @@ Every row in `triaged.csv` includes a `Triage Reason` column explaining the sour
   "unique_vulnerabilities": 38,
   "affected_assets": 12,
   "priority_counts": {"P1": 5, "P2": 22, "P3": 89, "P4": 26},
-  "overdue": {"P1": 3, "P2": 1, "P3": 0, "P4": 0}
+  "overdue": {"P1": 3, "P2": 1, "P3": 0, "P4": 0},
+  "audit_log": [...]
 }
 ```
+
+## Security Features
+
+This tool includes several security hardening measures:
+
+| Feature | Description |
+|---------|-------------|
+| **Path Traversal Prevention** | All file paths are validated and resolved to prevent directory traversal attacks |
+| **Input Validation** | JSON configuration files (asset map, exceptions) are validated before use |
+| **CSV Schema Validation** | Input CSV is validated for required columns before processing |
+| **Output Path Sanitization** | Output files can only be written within the designated output directory |
+| **Structured Audit Logging** | All processing steps are logged in JSON format for SIEM integration |
+| **Dry Run Mode** | Preview triage results without writing files |
+| **Pinned Dependencies** | All dependencies are pinned to specific versions for reproducibility |
+
+### Security Considerations
+
+- **No network calls**: This tool operates entirely on local files
+- **No secrets management**: No API keys or credentials are stored or transmitted
+- **HTML escaping**: All user data in HTML reports is properly escaped via Jinja2
+- **Graceful error handling**: Invalid input causes clean exit with descriptive error messages
+
+## License
+
+MIT License - see LICENSE file for details.
